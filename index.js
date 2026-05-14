@@ -307,8 +307,14 @@ class LocalizationBot {
 
     // ── Google Sheets ───────────────────────────────────────────────────────────
     async setupSheets() {
-        const credsFile = process.env.CREDENTIALS_FILE || './credentials.json';
-        const creds = JSON.parse(fs.readFileSync(credsFile, 'utf8'));
+        let creds;
+
+        if (process.env.GOOGLE_CREDENTIALS_JSON) {
+            creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
+        } else {
+            const credsFile = process.env.CREDENTIALS_FILE || './credentials.json';
+            creds = JSON.parse(fs.readFileSync(credsFile, 'utf8'));
+        }
 
         const auth = new JWT({
             email: creds.client_email,
