@@ -542,7 +542,11 @@ class LocalizationBot {
         // After successful submission, move the setup button to bottom
         await this._refreshSubmitButton(guild);
 
-        return { message: `✅ **${gameTitle}** submitted successfully! Thank you for your submission.` };
+        return {
+            message: `✅ **${gameTitle}** submitted successfully! Thank you for your submission.`,
+            canonicalTitle: gameTitle,
+            storeLink,
+        };
     }
 
     async createNewGame(user, title, link, platform, language, reason, owned, price) {
@@ -1717,17 +1721,7 @@ class LocalizationBot {
                 .setStyle(ButtonStyle.Primary);
 
             return interaction.reply({
-                content: [
-                    `✅ **Step 1 complete!** Here's what you entered:`,
-                    `> 🌍 Language: **${language}**`,
-                    `> 🎮 Game: **${gameTitle}**`,
-                    `> 🔗 Link: ${storeLink}`,
-                    `> 🎟️ Own it: **${owned}**`,
-                    ``,
-                    `Click the button below to continue.`,
-                    ``,
-                    `> 💡 **Note:** This is not a payment and does not obligate you. It helps us evaluate whether a localization project would be financially feasible before approaching the developer or launching a crowdfunding campaign.`,
-                ].join('\n'),
+                content: `✅ **Step 1 complete!** Click the button below to enter your estimated contribution.`,
                 components: [new ActionRowBuilder().addComponents(continueBtn)],
                 flags: [MessageFlags.Ephemeral],
             });
@@ -1772,7 +1766,21 @@ class LocalizationBot {
                 );
                 // Remove the "Continue" button from the Step 1 ephemeral message
                 await data1.part1Interaction.editReply({ components: [] }).catch(() => { });
-                return interaction.followUp({ content: result.message, flags: [MessageFlags.Ephemeral] });
+
+                const displayTitle = result.canonicalTitle || data1.gameTitle;
+                const priceDisplay = price > 0 ? `$${price}` : 'Not specified';
+                const ownedDisplay = data1.owned === 'Yes' ? 'Yes' : 'No';
+                const summaryLines = [
+                    result.message,
+                    ``,
+                    `📋 **Here's what you submitted:**`,
+                    `> 🌍 Language: **${data1.language}**`,
+                    `> 🎮 Game: **${displayTitle}**`,
+                    `> 🔗 Link: ${result.storeLink || data1.storeLink}`,
+                    `> 🎟️ Own it: **${ownedDisplay}**`,
+                    `> 💰 Estimated Contribution: **${priceDisplay}**`,
+                ];
+                return interaction.followUp({ content: summaryLines.join('\n'), flags: [MessageFlags.Ephemeral] });
             } catch (e) {
                 console.error('❌ Error processing submission:', e);
                 return interaction.followUp({ content: "❌ An error occurred. Please try again later.", flags: [MessageFlags.Ephemeral] });
