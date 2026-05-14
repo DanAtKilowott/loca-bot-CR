@@ -1,0 +1,30 @@
+{
+  "name": "game_vote_bot",
+  "version": "1.0.0",
+  "description": "## 📋 Overview This Discord bot allows users to submit games for localization requests and vote on existing submissions. All data is stored in Google Sheets.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specfied\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abdullahsajid/game_vote_bot.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/abdullahsajid/game_vote_bot/issues"
+  },
+  "homepage": "https://github.com/abdullahsajid/game_vote_bot#readme",
+  "dependencies": {
+    "axios": "^1.13.5",
+    "discord.js": "^14.25.1",
+    "dotenv": "^17.3.1",
+    "fast-fuzz": "^5.1.6",
+    "google-auth-library": "^10.5.0",
+    "google-spreadsheet": "^5.2.0",
+    "node-cron": "^4.2.1"
+  }
+}
