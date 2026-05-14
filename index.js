@@ -179,7 +179,7 @@ function buildSubmissionModal1() {
 }
 
 /** Submission Form 2: Price + Reason (shown after clicking Continue button) */
-function buildSubmissionModal2(owned) {
+function buildSubmissionModal2() {
     const modal = new ModalBuilder()
         .setCustomId('submission_part2')
         .setTitle('Submit for Localization (2/2)');
@@ -1639,16 +1639,6 @@ class LocalizationBot {
             return interaction.showModal(buildSubmissionModal1());
         }
 
-        // "Continue to Step 2" button — shown after submission form 1 is submitted
-        if (interaction.customId === 'submission_continue') {
-            const pending = this.pendingSubmissions.get(String(interaction.user.id));
-            if (!pending)
-                return interaction.reply({ content: "❌ Session expired. Please start again with /submit.", flags: [MessageFlags.Ephemeral] });
-
-            // Show form 2 — the button is removed from the Step 1 message once form 2 is submitted
-            return interaction.showModal(buildSubmissionModal2(pending.owned));
-        }
-
         // Persistent vote button (handles both old forum threads and new channel posts)
         if (interaction.customId === 'persistent_vote_button' || interaction.customId.startsWith('persistent_vote_button_')) {
             let gameId = null;
@@ -1713,18 +1703,9 @@ class LocalizationBot {
                 return interaction.reply({ content: "❌ Please select all dropdown options.", flags: [MessageFlags.Ephemeral] });
 
             // Store part-1 data (Platform defaults to PC as per client request to simplify)
-            this.pendingSubmissions.set(String(interaction.user.id), { platform: 'PC', language, owned, gameTitle, storeLink, part1Interaction: interaction });
+            this.pendingSubmissions.set(String(interaction.user.id), { platform: 'PC', language, owned, gameTitle, storeLink });
 
-            const continueBtn = new ButtonBuilder()
-                .setCustomId('submission_continue')
-                .setLabel('Continue to Step 2 →')
-                .setStyle(ButtonStyle.Primary);
-
-            return interaction.reply({
-                content: `✅ **Step 1 complete!** Click the button below to enter your estimated contribution.`,
-                components: [new ActionRowBuilder().addComponents(continueBtn)],
-                flags: [MessageFlags.Ephemeral],
-            });
+            return interaction.showModal(buildSubmissionModal2());
         }
 
         // ── Submission Form 2 ─────────────────────────────────────────────────
@@ -1764,9 +1745,6 @@ class LocalizationBot {
                     data1.language, reasonVal, data1.owned, price,
                     interaction.guild
                 );
-                // Remove the "Continue" button from the Step 1 ephemeral message
-                await data1.part1Interaction.editReply({ components: [] }).catch(() => { });
-
                 const displayTitle = result.canonicalTitle || data1.gameTitle;
                 const priceDisplay = price > 0 ? `$${price}` : 'Not specified';
                 const ownedDisplay = data1.owned === 'Yes' ? 'Yes' : 'No';
