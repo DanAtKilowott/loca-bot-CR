@@ -1639,6 +1639,14 @@ class LocalizationBot {
             return interaction.showModal(buildSubmissionModal1());
         }
 
+        // "Continue" button shown after submission modal 1 is submitted
+        if (interaction.customId === 'submission_continue') {
+            const pending = this.pendingSubmissions.get(String(interaction.user.id));
+            if (!pending)
+                return interaction.reply({ content: "❌ Session expired. Please start over by clicking Submit a Game.", flags: [MessageFlags.Ephemeral] });
+            return interaction.showModal(buildSubmissionModal2());
+        }
+
         // Persistent vote button (handles both old forum threads and new channel posts)
         if (interaction.customId === 'persistent_vote_button' || interaction.customId.startsWith('persistent_vote_button_')) {
             let gameId = null;
@@ -1705,7 +1713,16 @@ class LocalizationBot {
             // Store part-1 data (Platform defaults to PC as per client request to simplify)
             this.pendingSubmissions.set(String(interaction.user.id), { platform: 'PC', language, owned, gameTitle, storeLink });
 
-            return interaction.showModal(buildSubmissionModal2());
+            const continueBtn = new ButtonBuilder()
+                .setCustomId('submission_continue')
+                .setLabel('Continue →')
+                .setStyle(ButtonStyle.Primary);
+
+            return interaction.reply({
+                content: `✅ **Step 1 complete!** Click below to enter your estimated contribution.`,
+                components: [new ActionRowBuilder().addComponents(continueBtn)],
+                flags: [MessageFlags.Ephemeral],
+            });
         }
 
         // ── Submission Form 2 ─────────────────────────────────────────────────
