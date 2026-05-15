@@ -53,6 +53,7 @@ const RISING_THRESHOLD = parseInt(process.env.RISING_THRESHOLD || '5');
 const POPULAR_THRESHOLD = parseInt(process.env.POPULAR_THRESHOLD || '15');
 const ARCHIVE_DAYS = parseInt(process.env.ARCHIVE_DAYS || '14');
 const ARCHIVE_MIN_VOTES = parseInt(process.env.ARCHIVE_MIN_VOTES || '3');
+const VOTE_EXPORT_THRESHOLD = parseInt(process.env.VOTE_EXPORT_THRESHOLD || '100');
 const TRENDING_CHANNEL_ID = process.env.TRENDING_CHANNEL_ID && process.env.TRENDING_CHANNEL_ID !== '0'
     ? process.env.TRENDING_CHANNEL_ID : null;
 const ARCHIVED_CHANNEL_ID = process.env.ARCHIVED_CHANNEL_ID && process.env.ARCHIVED_CHANNEL_ID !== '0'
@@ -334,10 +335,16 @@ class LocalizationBot {
                     "Steam_AppID", "Platform", "Requested_Languages", "Total_Votes",
                     "First_Submitted_Timestamp_UTC", "Last_Vote_Timestamp_UTC", "Status", "Notes",
                     "Total_Owned_Yes", "Total_Owned_No", "Total_Willing_Pay_Count", "Total_Willing_Pay_Sum",
-                    "Thread_ID"
+                    "Thread_ID", "Exported"
                 ]
             });
             console.log('✅ Created Games_Master sheet');
+        } else {
+            await this.gamesSheet.loadHeaderRow();
+            if (!this.gamesSheet.headerValues.includes('Exported')) {
+                await this.gamesSheet.setHeaderRow([...this.gamesSheet.headerValues, 'Exported']);
+                console.log('✅ Added Exported column to Games_Master');
+            }
         }
 
         this.votesSheet = this.doc.sheetsByTitle['Votes_Log'];
@@ -376,6 +383,7 @@ class LocalizationBot {
             Total_Willing_Pay_Count: parseInt(r.get('Total_Willing_Pay_Count') || 0),
             Total_Willing_Pay_Sum: parseFloat(r.get('Total_Willing_Pay_Sum') || 0),
             Thread_ID: r.get('Thread_ID'),
+            Exported: r.get('Exported') === 'true',
         };
     }
 
@@ -659,6 +667,13 @@ class LocalizationBot {
             }),
             this.updateGameMomentum(game.Game_ID, newVotes)
         ]);
+
+        // Trigger 100-vote export (runs after save so the vote row is in cache)
+        if (newVotes >= VOTE_EXPORT_THRESHOLD && !game.Exported) {
+            this._exportGameToSheet(game).catch(e =>
+                console.error(`❌ Export failed for ${game.Game_ID}:`, e.message)
+            );
+        }
 
         console.log(`   ✓ Vote processed and logged: ${game.Game_ID}`);
     }
@@ -1556,6 +1571,90 @@ class LocalizationBot {
         game.Total_Willing_Pay_Count = 0;
         game.Total_Willing_Pay_Sum = 0;
         this.votesCache = this.votesCache.filter(v => String(v.Game_ID) !== String(gameId));
+    }
+
+    // ── 100-Vote Export ─────────────────────────────────────────────────────────
+
+    async _exportGameToSheet(game) {
+        if (game.Exported) return;
+
+        console.log(`📊 Exporting ${game.Game_ID} — reached ${VOTE_EXPORT_THRESHOLD} votes`);
+
+        const sheetTitle = `Export — ${game.Canonical_Title}`.substring(0, 100);
+
+        // Idempotency: skip if sheet already exists
+        if (!this.doc.sheetsByTitle[sheetTitle]) {
+            const gameVotes = this.votesCache.filter(v => String(v.Game_ID) === String(game.Game_ID));
+
+            // Per-language vote + pay breakdown
+            const langVotes = {};
+            const langPay = {};
+            for (const vote of gameVotes) {
+                const lang = vote.Language || 'Unknown';
+                langVotes[lang] = (langVotes[lang] || 0) + 1;
+                const p = parseFloat(vote.Willing_Pay) || 0;
+                if (p > 0) {
+                    if (!langPay[lang]) langPay[lang] = { count: 0, sum: 0 };
+                    langPay[lang].count++;
+                    langPay[lang].sum += p;
+                }
+            }
+
+            const ownedYes = game.Total_Owned_Yes || 0;
+            const ownedNo = game.Total_Owned_No || 0;
+            const totalOwned = ownedYes + ownedNo;
+            const pct = (n, d) => d > 0 ? ` (${Math.round(n / d * 100)}%)` : '';
+
+            const payCount = game.Total_Willing_Pay_Count || 0;
+            const paySum = parseFloat(game.Total_Willing_Pay_Sum) || 0;
+            const payAvg = payCount > 0 ? `$${(paySum / payCount).toFixed(2)}` : '—';
+
+            const langs = (game.Requested_Languages || '').split('|').map(l => l.trim()).filter(Boolean);
+
+            const exportSheet = await this.doc.addSheet({
+                title: sheetTitle,
+                headerValues: ['Field', 'Value'],
+            });
+
+            const rows = [
+                { Field: '── GAME INFO ──', Value: '' },
+                { Field: 'Title', Value: game.Canonical_Title },
+                { Field: 'Game ID', Value: game.Game_ID },
+                { Field: 'Steam Link', Value: game.Store_Link || '—' },
+                { Field: 'Steam App ID', Value: game.Steam_AppID || '—' },
+                { Field: 'Platform', Value: game.Platform || '—' },
+                { Field: 'Requested Language(s)', Value: langs.join(', ') || '—' },
+                { Field: 'First Submitted', Value: game.First_Submitted_Timestamp_UTC || '—' },
+                { Field: 'Last Vote', Value: game.Last_Vote_Timestamp_UTC || '—' },
+                { Field: '', Value: '' },
+                { Field: '── VOTE SUMMARY ──', Value: '' },
+                { Field: 'Total Votes', Value: String(game.Total_Votes || 0) },
+                { Field: 'Own the Game — Yes', Value: `${ownedYes}${pct(ownedYes, totalOwned)}` },
+                { Field: 'Own the Game — No', Value: `${ownedNo}${pct(ownedNo, totalOwned)}` },
+                { Field: '', Value: '' },
+                { Field: '── WILLINGNESS TO PAY ──', Value: '' },
+                { Field: 'Voters Who Named a Price', Value: String(payCount) },
+                { Field: 'Average Willing to Pay', Value: payAvg },
+                { Field: 'Total Pay Pool', Value: payCount > 0 ? `$${paySum.toFixed(2)}` : '—' },
+                { Field: '', Value: '' },
+                { Field: '── VOTES BY LANGUAGE ──', Value: '' },
+            ];
+
+            // Language rows sorted by vote count descending
+            for (const [lang, count] of Object.entries(langVotes).sort((a, b) => b[1] - a[1])) {
+                const p = langPay[lang];
+                const payNote = p ? ` | avg pay: $${(p.sum / p.count).toFixed(2)}` : '';
+                rows.push({ Field: lang, Value: `${count} vote(s)${payNote}` });
+            }
+
+            await exportSheet.addRows(rows);
+            console.log(`   ✅ Export sheet created: "${sheetTitle}"`);
+        }
+
+        // Mark as exported so this never fires again for this game
+        game._row.set('Exported', 'true');
+        await game._row.save();
+        game.Exported = true;
     }
 
     // ── Command Registration ────────────────────────────────────────────────────
