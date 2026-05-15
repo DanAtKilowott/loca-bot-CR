@@ -458,10 +458,11 @@ class LocalizationBot {
         return null;
     }
 
-    checkDuplicateVote(userId, gameId) {
+    checkDuplicateVote(userId, gameId, language) {
         return this.votesCache.some(v =>
             String(v.Discord_User_ID) === String(userId) &&
-            String(v.Game_ID) === String(gameId)
+            String(v.Game_ID) === String(gameId) &&
+            v.Language === language
         );
     }
 
@@ -519,8 +520,8 @@ class LocalizationBot {
 
         const duplicate = this.findDuplicateGame(gameTitle, storeLink);
         if (duplicate) {
-            if (this.checkDuplicateVote(user.id, duplicate.Game_ID))
-                return { message: `❌ You already voted for **${duplicate.Canonical_Title}**. Each user can only vote once per game.` };
+            if (this.checkDuplicateVote(user.id, duplicate.Game_ID, language))
+                return { message: `❌ You already voted for **${duplicate.Canonical_Title}** in **${language}**. Try a different language or a different game!` };
             await this.addVoteToExistingGame(user, duplicate, language, owned, price);
             // After successful vote via form, move the setup button to bottom
             await this._refreshSubmitButton(guild);
@@ -666,8 +667,8 @@ class LocalizationBot {
         const game = this.gamesCache.find(g => g.Game_ID === gameId);
         if (!game) return { message: "❌ Game not found." };
 
-        if (this.checkDuplicateVote(user.id, gameId))
-            return { message: `❌ You already voted for **${game.Canonical_Title}**. Each user can only vote once per game.` };
+        if (this.checkDuplicateVote(user.id, gameId, language))
+            return { message: `❌ You already voted for **${game.Canonical_Title}** in **${language}**. Try a different language!` };
 
         await this.addVoteToExistingGame(user, game, language, owned, price);
 
@@ -687,20 +688,17 @@ class LocalizationBot {
 
     async updateGameMomentum(gameId, totalVotes) {
         let newStatus = null;
-        let targetChannelId = null;
 
         if (totalVotes >= POPULAR_THRESHOLD) {
             newStatus = "Popular";
-            targetChannelId = POPULAR_CHANNEL_ID;
         } else if (totalVotes >= RISING_THRESHOLD) {
             newStatus = "Rising";
-            targetChannelId = RISING_CHANNEL_ID;
         } else {
             return;
         }
 
         const game = this.gamesCache.find(g => g.Game_ID === gameId);
-        if (!game || !targetChannelId) return;
+        if (!game) return;
 
         const currentStatus = game.Status || 'New';
         const rank = { 'New': 0, 'Archived': 0, 'Rising': 1, 'Popular': 2, 'Approved': 3, 'Reviewed': 3, 'Contacted': 4, 'In Talk': 5, 'Funded': 6, 'In Loc': 7, 'Done': 8 };
@@ -709,36 +707,65 @@ class LocalizationBot {
         try {
             console.log(`   📊 Momentum: ${game.Canonical_Title} ${currentStatus} → ${newStatus}`);
 
-            // If game was Archived, log the resurrection
             if (currentStatus === 'Archived') {
                 console.log(`   🌟 Resurrection! ${game.Canonical_Title} is back from the archive!`);
             }
 
-            // Capture chat history before deleting the old post
-            const chatHistory = await this._getChatHistory(game);
-
-            // Delete old post/thread from the previous channel
-            await this._deleteOldPost(game);
-
-            // Update status in sheet before posting to new channel
+            // Update status in sheet
             game._row.set('Status', newStatus);
             await game._row.save();
             game.Status = newStatus;
 
-            // Re-post to the new status channel
-            for (const guild of this.client.guilds.cache.values()) {
-                const channel = await guild.channels.fetch(targetChannelId).catch(() => null);
-                if (channel) {
-                    const appId = extractSteamAppId(game.Store_Link);
-                    let description = null, image = null;
-                    if (appId) {
-                        const details = await this.fetchSteamGameDetails(appId);
-                        description = details?.description;
-                        image = details?.image;
+            // Edit thread embed in-place in NEW_CHANNEL_ID
+            if (NEW_CHANNEL_ID && game.Thread_ID) {
+                for (const guild of this.client.guilds.cache.values()) {
+                    try {
+                        const channel = guild.channels.cache.get(NEW_CHANNEL_ID) ||
+                            await guild.channels.fetch(NEW_CHANNEL_ID).catch(() => null);
+                        if (!channel) continue;
+
+                        const thread = await guild.channels.fetch(game.Thread_ID).catch(() => null);
+                        if (!thread) continue;
+
+                        const emojiMap = { 'New': '🆕', 'Rising': '📈', 'Popular': '🔥', 'Approved': '✅', 'Archived': '❄️' };
+                        const statusEmoji = emojiMap[newStatus] || '🎮';
+                        const colorMap = { 'Popular': 0xFF4500, 'Rising': 0xFFAA00 };
+                        const embedColor = colorMap[newStatus] || 0x0099FF;
+
+                        const starter = await thread.fetchStarterMessage().catch(() => null);
+                        if (starter) {
+                            const oldEmbed = starter.embeds[0];
+                            const updatedEmbed = new EmbedBuilder()
+                                .setTitle(`${statusEmoji} ${game.Canonical_Title}`)
+                                .setDescription(oldEmbed?.description || "Support this game's localization!")
+                                .setColor(embedColor)
+                                .setFooter({ text: "The more votes, the higher the chance of localization!" });
+
+                            if (oldEmbed?.thumbnail?.url) updatedEmbed.setThumbnail(oldEmbed.thumbnail.url);
+                            if (oldEmbed?.fields) updatedEmbed.addFields(oldEmbed.fields);
+
+                            const row = new ActionRowBuilder().addComponents(
+                                new ButtonBuilder()
+                                    .setCustomId(`persistent_vote_button_${game.Game_ID}`)
+                                    .setLabel('🗳️ Vote for This Game')
+                                    .setStyle(ButtonStyle.Primary)
+                            );
+
+                            await starter.edit({ embeds: [updatedEmbed], components: [row] }).catch(() => { });
+                            await thread.setName(`${statusEmoji} ${game.Canonical_Title}`.substring(0, 100)).catch(() => { });
+                        }
+
+                        await this._ensureAndApplyTags(channel, thread, game);
+                        break;
+                    } catch (innerErr) {
+                        console.warn(`   ⚠️ Could not update thread for ${gameId} in guild ${guild.name}: ${innerErr.message}`);
                     }
-                    await this.postToGameChannel(guild, game.Game_ID, game.Canonical_Title, game.Store_Link, game.Platform, game.Requested_Languages.split('|')[0], game.Notes, description, image, targetChannelId, chatHistory);
-                    break;
                 }
+            }
+
+            // Update dashboard in all guilds
+            for (const guild of this.client.guilds.cache.values()) {
+                await this.updateDashboard(guild).catch(() => { });
             }
 
         } catch (e) {
@@ -983,6 +1010,174 @@ class LocalizationBot {
             console.warn(`   ⚠️ Warning: Deep cleanup for ${gid} encountered issues: ${e.message}`);
         }
     }
+    // ── Tag Management ──────────────────────────────────────────────────────────
+    async _ensureAndApplyTags(channel, thread, game) {
+        if (!channel || channel.type !== ChannelType.GuildForum) return;
+        try {
+            // Build list of desired tag names (status + languages), capped at 5
+            const statusName = game.Status || 'New';
+            const langs = (game.Requested_Languages || '').split('|').map(l => l.trim()).filter(Boolean);
+            const desiredNames = [statusName, ...langs].slice(0, 5);
+
+            // Ensure all desired tags exist on the channel (max 20 total)
+            let existingTags = [...(channel.availableTags || [])];
+            const existingNames = new Set(existingTags.map(t => t.name));
+            const toCreate = desiredNames.filter(n => !existingNames.has(n));
+
+            if (toCreate.length > 0) {
+                const canCreate = Math.max(0, 20 - existingTags.length);
+                const creating = toCreate.slice(0, canCreate);
+                if (creating.length > 0) {
+                    const updated = await channel.setAvailableTags([
+                        ...existingTags,
+                        ...creating.map(name => ({ name }))
+                    ]).catch(() => null);
+                    if (updated) existingTags = [...(updated.availableTags || [])];
+                }
+            }
+
+            // Resolve tag IDs for the desired names
+            const tagIds = desiredNames
+                .map(name => existingTags.find(t => t.name === name)?.id)
+                .filter(Boolean)
+                .slice(0, 5);
+
+            if (tagIds.length > 0 && thread?.setAppliedTags) {
+                await thread.setAppliedTags(tagIds).catch(() => { });
+            }
+        } catch (e) {
+            console.warn(`   ⚠️ Tag operation failed for ${game?.Game_ID}: ${e.message}`);
+        }
+    }
+
+    // ── Dashboard ───────────────────────────────────────────────────────────────
+    async updateDashboard(guild) {
+        if (!NEW_CHANNEL_ID) return null;
+        try {
+            const channel = guild.channels.cache.get(NEW_CHANNEL_ID) ||
+                await guild.channels.fetch(NEW_CHANNEL_ID).catch(() => null);
+            if (!channel || channel.type !== ChannelType.GuildForum) return null;
+
+            const DASHBOARD_NAME = '📊 Loca Rankings';
+            const now = Date.now();
+            const weekAgo = now - (7 * 86400000);
+
+            // Build embed sections
+            const excludedStatuses = ['Archived', 'Done', 'Rejected'];
+
+            // Popular section
+            const popularGames = this.gamesCache
+                .filter(g => (g.Total_Votes || 0) >= POPULAR_THRESHOLD && !excludedStatuses.includes(g.Status))
+                .sort((a, b) => b.Total_Votes - a.Total_Votes)
+                .slice(0, 10);
+
+            // Rising section
+            const risingGames = this.gamesCache
+                .filter(g => (g.Total_Votes || 0) >= RISING_THRESHOLD && (g.Total_Votes || 0) < POPULAR_THRESHOLD && !excludedStatuses.includes(g.Status))
+                .sort((a, b) => b.Total_Votes - a.Total_Votes)
+                .slice(0, 10);
+
+            // Trending this week (from votesCache)
+            const weeklyVotesMap = new Map();
+            for (const v of this.votesCache) {
+                const vts = new Date(v.Timestamp_UTC).getTime();
+                if (vts >= weekAgo) {
+                    weeklyVotesMap.set(v.Game_ID, (weeklyVotesMap.get(v.Game_ID) || 0) + 1);
+                }
+            }
+            const trendingGames = [...weeklyVotesMap.entries()]
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 5)
+                .map(([gid]) => this.gamesCache.find(g => g.Game_ID === gid))
+                .filter(Boolean);
+
+            // Recently archived
+            const archivedGames = this.gamesCache
+                .filter(g => g.Status === 'Archived')
+                .sort((a, b) => new Date(b.Last_Vote_Timestamp_UTC).getTime() - new Date(a.Last_Vote_Timestamp_UTC).getTime())
+                .slice(0, 5);
+
+            const embed = new EmbedBuilder()
+                .setTitle('📊 Loca Rankings')
+                .setColor(0x5865F2)
+                .setFooter({ text: 'Updated daily at midnight · /dashboard to refresh' })
+                .setTimestamp();
+
+            const hasAnyData = popularGames.length > 0 || risingGames.length > 0 || trendingGames.length > 0 || archivedGames.length > 0;
+
+            if (!hasAnyData) {
+                embed.setDescription('No games yet — be the first to submit!');
+            } else {
+                if (popularGames.length > 0) {
+                    embed.addFields({
+                        name: '🔥 Popular',
+                        value: popularGames.map(g => {
+                            const langs = (g.Requested_Languages || '').split('|').map(l => l.trim()).filter(Boolean).join(', ');
+                            return `**${g.Canonical_Title}**${langs ? ` — ${langs}` : ''}`;
+                        }).join('\n'),
+                        inline: false
+                    });
+                }
+
+                if (risingGames.length > 0) {
+                    embed.addFields({
+                        name: '📈 Rising',
+                        value: risingGames.map(g => {
+                            const langs = (g.Requested_Languages || '').split('|').map(l => l.trim()).filter(Boolean).join(', ');
+                            return `**${g.Canonical_Title}**${langs ? ` — ${langs}` : ''}`;
+                        }).join('\n'),
+                        inline: false
+                    });
+                }
+
+                if (trendingGames.length > 0) {
+                    const medals = ['🥇', '🥈', '🥉', '4.', '5.'];
+                    embed.addFields({
+                        name: '📊 Trending This Week',
+                        value: trendingGames.map((g, i) => `${medals[i]} **${g.Canonical_Title}**`).join('\n'),
+                        inline: false
+                    });
+                }
+
+                if (archivedGames.length > 0) {
+                    embed.addFields({
+                        name: '❄️ Recently Archived',
+                        value: archivedGames.map(g => `**${g.Canonical_Title}**`).join('\n'),
+                        inline: false
+                    });
+                }
+            }
+
+            // Find or create pinned dashboard thread
+            let dashThread = null;
+
+            // Search active threads
+            const active = await channel.threads.fetchActive().catch(() => ({ threads: new Map() }));
+            dashThread = active.threads.find(t => t.name === DASHBOARD_NAME) || null;
+
+            if (dashThread) {
+                // Update existing thread's starter message
+                const starter = await dashThread.fetchStarterMessage().catch(() => null);
+                if (starter) {
+                    await starter.edit({ embeds: [embed] }).catch(() => { });
+                }
+            } else {
+                // Create new pinned thread
+                dashThread = await channel.threads.create({
+                    name: DASHBOARD_NAME,
+                    message: { embeds: [embed] }
+                });
+                await dashThread.pin().catch(() => { });
+            }
+
+            console.log(`   ✅ Dashboard updated in ${guild.name}`);
+            return dashThread;
+        } catch (e) {
+            console.error(`   ❌ Error updating dashboard for ${guild?.name}: ${e.message}`);
+            return null;
+        }
+    }
+
     async autoArchiveGames() {
         console.log("🔄 Running daily auto-archive sweep...");
         const now = Date.now();
@@ -997,43 +1192,61 @@ class LocalizationBot {
             if (isNaN(submittedTs)) continue;
 
             const ageDays = (now - submittedTs) / 86400000;
-            if (ageDays >= ARCHIVE_DAYS) {
-                if ((game.Total_Votes || 0) < ARCHIVE_MIN_VOTES) {
-                    try {
-                        // Delete old post from current channel
-                        await this._deleteOldPost(game);
+            if (ageDays >= ARCHIVE_DAYS && (game.Total_Votes || 0) < ARCHIVE_MIN_VOTES) {
+                try {
+                    // Update status in sheet
+                    game._row.set('Status', 'Archived');
+                    await game._row.save();
+                    game.Status = 'Archived';
+                    archived++;
 
-                        // Update status
-                        game._row.set('Status', 'Archived');
-                        await game._row.save();
-                        game.Status = 'Archived';
-                        archived++;
+                    // Edit thread embed in-place in NEW_CHANNEL_ID
+                    if (NEW_CHANNEL_ID && game.Thread_ID) {
+                        for (const guild of this.client.guilds.cache.values()) {
+                            try {
+                                const channel = guild.channels.cache.get(NEW_CHANNEL_ID) ||
+                                    await guild.channels.fetch(NEW_CHANNEL_ID).catch(() => null);
+                                if (!channel) continue;
 
-                        // Post to archived channel (staff-only) if configured
-                        if (ARCHIVED_CHANNEL_ID) {
-                            for (const guild of this.client.guilds.cache.values()) {
-                                const targetChannel = await guild.channels.fetch(ARCHIVED_CHANNEL_ID).catch(() => null);
-                                if (targetChannel) {
-                                    const appId = extractSteamAppId(game.Store_Link);
-                                    let description = null, image = null;
-                                    if (appId) {
-                                        const details = await this.fetchSteamGameDetails(appId);
-                                        description = details?.description;
-                                        image = details?.image;
-                                    }
-                                    await this.postToGameChannel(guild, game.Game_ID, game.Canonical_Title, game.Store_Link, game.Platform, game.Requested_Languages.split('|')[0], '', description, image, ARCHIVED_CHANNEL_ID);
-                                    break; // Successfully posted to the guild that owns the channel
+                                const thread = await guild.channels.fetch(game.Thread_ID).catch(() => null);
+                                if (!thread) continue;
+
+                                const starter = await thread.fetchStarterMessage().catch(() => null);
+                                if (starter) {
+                                    const oldEmbed = starter.embeds[0];
+                                    const updatedEmbed = new EmbedBuilder()
+                                        .setTitle(`❄️ ${game.Canonical_Title}`)
+                                        .setDescription(oldEmbed?.description || "This game has been archived.")
+                                        .setColor(0x808080)
+                                        .setFooter({ text: "The more votes, the higher the chance of localization!" });
+
+                                    if (oldEmbed?.thumbnail?.url) updatedEmbed.setThumbnail(oldEmbed.thumbnail.url);
+                                    if (oldEmbed?.fields) updatedEmbed.addFields(oldEmbed.fields);
+
+                                    await starter.edit({ embeds: [updatedEmbed] }).catch(() => { });
+                                    await thread.setName(`❄️ ${game.Canonical_Title}`.substring(0, 100)).catch(() => { });
                                 }
+
+                                await this._ensureAndApplyTags(channel, thread, game);
+                                break;
+                            } catch (innerErr) {
+                                console.warn(`   ⚠️ Could not update thread for ${game.Game_ID}: ${innerErr.message}`);
                             }
                         }
-
-                        console.log(`   ❄️ Archived: ${game.Canonical_Title} (${game.Total_Votes} votes, ${Math.floor(ageDays)} days old)`);
-                    } catch (e) {
-                        console.error(`   ⚠️ Archive error for ${game.Game_ID}: ${e.message}`);
                     }
+
+                    console.log(`   ❄️ Archived: ${game.Canonical_Title} (${game.Total_Votes} votes, ${Math.floor(ageDays)} days old)`);
+                } catch (e) {
+                    console.error(`   ⚠️ Archive error for ${game.Game_ID}: ${e.message}`);
                 }
             }
         }
+
+        // Update dashboard for all guilds after archive sweep
+        for (const guild of this.client.guilds.cache.values()) {
+            await this.updateDashboard(guild).catch(() => { });
+        }
+
         console.log(`❄️ Archive sweep complete: ${archived} games.`);
     }
 
@@ -1174,17 +1387,14 @@ class LocalizationBot {
                     }
                     await existingThread.setName(threadTitle).catch(() => { });
                     message = existingThread;
+                    if (game) await this._ensureAndApplyTags(channel, existingThread, game);
                 } else {
-                    const forumTag = channel.availableTags?.find(t =>
-                        t.name.toLowerCase() === statusLabel.toLowerCase() ||
-                        t.name.toLowerCase().includes(statusLabel.toLowerCase())
-                    );
                     const thread = await channel.threads.create({
                         name: threadTitle,
-                        appliedTags: forumTag ? [forumTag.id] : [],
                         message: { embeds: [embed], components: [row] },
                     });
                     message = thread;
+                    if (game) await this._ensureAndApplyTags(channel, thread, game);
                 }
             } else {
                 // Standard text channel logic - with duplicate prevention
@@ -1299,6 +1509,12 @@ class LocalizationBot {
                 name: 'refresh', description: '[ADMIN] Refresh games cache from Google Sheets',
                 default_member_permissions: '8'
             },
+            { name: 'dashboard', description: 'Update the pinned rankings thread now' },
+            {
+                name: 'approve', description: '[ADMIN] Approve a game for localization pursuit',
+                options: [{ type: 3, name: 'game_id', description: 'Game ID (e.g. GAME_00001)', required: true }],
+                default_member_permissions: '8'
+            },
         ];
 
         const rest = new REST({ version: '10' }).setToken(TOKEN);
@@ -1352,11 +1568,13 @@ class LocalizationBot {
                 }
             });
 
-            // 3. Daily Trending Report - Every day at 09:00 AM CET
-            cron.schedule('0 9 * * *', () => {
-                console.log("⏰ Cron: Starting Daily Trending Summary (09:00 AM CET)...");
-                this.postWeeklyTrending().catch(e => console.error("❌ Cron Trending Error:", e));
-            }, { timezone: 'CET' });
+            // 3. Daily Dashboard Update - Every day at midnight
+            cron.schedule('0 0 * * *', () => {
+                console.log("⏰ Cron: Updating pinned dashboard...");
+                for (const guild of this.client.guilds.cache.values()) {
+                    this.updateDashboard(guild).catch(e => console.error(`❌ Cron Dashboard Error (${guild.name}):`, e));
+                }
+            });
         });
 
         this.client.on(Events.InteractionCreate, async (interaction) => {
@@ -1624,6 +1842,77 @@ class LocalizationBot {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
             await this.refreshCache();
             return interaction.followUp({ content: `✅ Cache refreshed! ${this.gamesCache.length} games loaded.`, flags: [MessageFlags.Ephemeral] });
+        }
+
+        if (commandName === 'dashboard') {
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            await this.updateDashboard(interaction.guild);
+            return interaction.followUp({ content: "✅ Rankings updated!", flags: [MessageFlags.Ephemeral] });
+        }
+
+        if (commandName === 'approve') {
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            if (!interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)) {
+                return interaction.followUp({ content: "❌ You need Administrator permissions to use this command.", flags: [MessageFlags.Ephemeral] });
+            }
+            const gameId = interaction.options.getString('game_id');
+            const game = this.gamesCache.find(g => g.Game_ID === gameId);
+            if (!game) return interaction.followUp({ content: "❌ Game not found.", flags: [MessageFlags.Ephemeral] });
+
+            try {
+                // Update status in sheet
+                game._row.set('Status', 'Approved');
+                await game._row.save();
+                game.Status = 'Approved';
+
+                // Edit thread embed in-place
+                if (NEW_CHANNEL_ID && game.Thread_ID) {
+                    for (const guild of this.client.guilds.cache.values()) {
+                        try {
+                            const channel = guild.channels.cache.get(NEW_CHANNEL_ID) ||
+                                await guild.channels.fetch(NEW_CHANNEL_ID).catch(() => null);
+                            if (!channel) continue;
+
+                            const thread = await guild.channels.fetch(game.Thread_ID).catch(() => null);
+                            if (!thread) continue;
+
+                            const starter = await thread.fetchStarterMessage().catch(() => null);
+                            if (starter) {
+                                const oldEmbed = starter.embeds[0];
+                                const updatedEmbed = new EmbedBuilder()
+                                    .setTitle(`✅ ${game.Canonical_Title}`)
+                                    .setDescription(oldEmbed?.description || "Support this game's localization!")
+                                    .setColor(0x00CC44)
+                                    .setFooter({ text: "The more votes, the higher the chance of localization!" });
+
+                                if (oldEmbed?.thumbnail?.url) updatedEmbed.setThumbnail(oldEmbed.thumbnail.url);
+                                if (oldEmbed?.fields) updatedEmbed.addFields(oldEmbed.fields);
+
+                                const row = new ActionRowBuilder().addComponents(
+                                    new ButtonBuilder()
+                                        .setCustomId(`persistent_vote_button_${game.Game_ID}`)
+                                        .setLabel('🗳️ Vote for This Game')
+                                        .setStyle(ButtonStyle.Primary)
+                                );
+
+                                await starter.edit({ embeds: [updatedEmbed], components: [row] }).catch(() => { });
+                                await thread.setName(`✅ ${game.Canonical_Title}`.substring(0, 100)).catch(() => { });
+                            }
+
+                            await this._ensureAndApplyTags(channel, thread, game);
+                            break;
+                        } catch (innerErr) {
+                            console.warn(`   ⚠️ Could not update thread for ${gameId}: ${innerErr.message}`);
+                        }
+                    }
+                }
+
+                await this.updateDashboard(interaction.guild);
+                return interaction.followUp({ content: `✅ **${game.Canonical_Title}** marked as Approved.`, flags: [MessageFlags.Ephemeral] });
+            } catch (err) {
+                console.error(err);
+                return interaction.followUp({ content: `❌ Error approving game: ${err.message}`, flags: [MessageFlags.Ephemeral] });
+            }
         }
     }
 
