@@ -1450,7 +1450,41 @@ class LocalizationBot {
                 name: 'search', description: 'Search for games in the database',
                 options: [{ name: 'query', type: 3, description: 'Search term', required: true }]
             },
-            { name: 'top', description: 'Show top requested games' },
+            {
+                name: 'top', description: '[ADMIN] View top games by various filters',
+                default_member_permissions: '8',
+                options: [
+                    {
+                        type: 1, name: 'all', description: 'Overall ranking by total votes',
+                        options: [{ type: 4, name: 'count', description: 'Number of games to show (default: 10)', required: false }]
+                    },
+                    {
+                        type: 1, name: 'language', description: 'Top games requested for a specific language',
+                        options: [
+                            { type: 3, name: 'language', description: 'Language to filter by (e.g. German)', required: true },
+                            { type: 4, name: 'count', description: 'Number of games to show (default: 10)', required: false }
+                        ]
+                    },
+                    {
+                        type: 1, name: 'trending', description: 'Top games by votes cast in the last 7 days',
+                        options: [{ type: 4, name: 'count', description: 'Number of games to show (default: 5)', required: false }]
+                    },
+                    {
+                        type: 1, name: 'status', description: 'Top games filtered by status',
+                        options: [
+                            {
+                                type: 3, name: 'status', description: 'Status to filter by', required: true,
+                                choices: [
+                                    { name: 'New', value: 'New' }, { name: 'Rising', value: 'Rising' },
+                                    { name: 'Popular', value: 'Popular' }, { name: 'Approved', value: 'Approved' },
+                                    { name: 'Archived', value: 'Archived' }
+                                ]
+                            },
+                            { type: 4, name: 'count', description: 'Number of games to show (default: 10)', required: false }
+                        ]
+                    }
+                ]
+            },
             {
                 name: 'setup_submission', description: '[ADMIN] Create a persistent submission button',
                 default_member_permissions: '8'
@@ -1665,19 +1699,95 @@ class LocalizationBot {
 
         if (commandName === 'top') {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-            const sorted = [...this.gamesCache].sort((a, b) => b.Total_Votes - a.Total_Votes);
-            const embed = new EmbedBuilder()
-                .setTitle("🏆 Top Requested Games")
-                .setDescription("Most requested games for localization")
-                .setColor(0xFFD700);
-            sorted.slice(0, 10).forEach((g, i) => {
-                const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i + 1}.`;
-                embed.addFields({
-                    name: `${medal} ${g.Canonical_Title}`,
-                    value: `${g.Platform} | Status: ${g.Status}\nLanguages: ${g.Requested_Languages || 'N/A'}\nID: \`${g.Game_ID}\``,
-                    inline: false,
-                });
+            const sub = interaction.options.getSubcommand();
+            const count = Math.min(interaction.options.getInteger('count') || (sub === 'trending' ? 5 : 10), 25);
+            const statusEmoji = { 'New': '🆕', 'Rising': '📈', 'Popular': '🔥', 'Approved': '✅', 'Archived': '❄️' };
+            const medal = i => i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
+
+            const formatGame = (g, i) => ({
+                name: `${medal(i)} ${g.Canonical_Title}`,
+                value: [
+                    `**Votes:** ${g.Total_Votes} | **Status:** ${statusEmoji[g.Status] || '🎮'} ${g.Status}`,
+                    `**Languages:** ${(g.Requested_Languages || 'N/A').split('|').join(', ')}`,
+                    `**ID:** \`${g.Game_ID}\` | [Steam](${g.Store_Link})`,
+                ].join('\n'),
+                inline: false,
             });
+
+            let embed, games;
+
+            if (sub === 'all') {
+                games = [...this.gamesCache]
+                    .filter(g => g.Status !== 'Rejected')
+                    .sort((a, b) => b.Total_Votes - a.Total_Votes)
+                    .slice(0, count);
+                embed = new EmbedBuilder()
+                    .setTitle(`🏆 Top ${count} Games — All`)
+                    .setDescription('Overall ranking by total votes')
+                    .setColor(0xFFD700);
+            }
+
+            if (sub === 'language') {
+                const lang = interaction.options.getString('language');
+                games = [...this.gamesCache]
+                    .filter(g => g.Status !== 'Rejected' && (g.Requested_Languages || '').split('|').map(l => l.trim().toLowerCase()).includes(lang.toLowerCase()))
+                    .sort((a, b) => b.Total_Votes - a.Total_Votes)
+                    .slice(0, count);
+                embed = new EmbedBuilder()
+                    .setTitle(`🌍 Top ${count} Games — ${lang}`)
+                    .setDescription(`Games with at least one vote requesting **${lang}** localisation`)
+                    .setColor(0x0099FF);
+                if (games.length === 0)
+                    return interaction.followUp({ content: `❌ No games found with **${lang}** in their requested languages.`, flags: [MessageFlags.Ephemeral] });
+            }
+
+            if (sub === 'trending') {
+                const weekAgo = Date.now() - 7 * 86400000;
+                const weeklyVotes = new Map();
+                for (const v of this.votesCache) {
+                    if (new Date(v.Timestamp_UTC).getTime() >= weekAgo)
+                        weeklyVotes.set(v.Game_ID, (weeklyVotes.get(v.Game_ID) || 0) + 1);
+                }
+                games = [...weeklyVotes.entries()]
+                    .sort((a, b) => b[1] - a[1])
+                    .slice(0, count)
+                    .map(([gid, weekVotes]) => ({ ...this.gamesCache.find(g => g.Game_ID === gid), _weekVotes: weekVotes }))
+                    .filter(g => g.Game_ID);
+                embed = new EmbedBuilder()
+                    .setTitle(`📊 Top ${count} Trending — Last 7 Days`)
+                    .setDescription('Games gaining the most votes this week')
+                    .setColor(0xFFAA00);
+                if (games.length === 0)
+                    return interaction.followUp({ content: '❌ No votes recorded in the last 7 days.', flags: [MessageFlags.Ephemeral] });
+                games.forEach((g, i) => embed.addFields({
+                    name: `${medal(i)} ${g.Canonical_Title}`,
+                    value: [
+                        `**This week:** ${g._weekVotes} vote${g._weekVotes !== 1 ? 's' : ''} | **Total:** ${g.Total_Votes} | **Status:** ${statusEmoji[g.Status] || '🎮'} ${g.Status}`,
+                        `**Languages:** ${(g.Requested_Languages || 'N/A').split('|').join(', ')}`,
+                        `**ID:** \`${g.Game_ID}\` | [Steam](${g.Store_Link})`,
+                    ].join('\n'),
+                    inline: false,
+                }));
+                return interaction.followUp({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+            }
+
+            if (sub === 'status') {
+                const filterStatus = interaction.options.getString('status');
+                games = [...this.gamesCache]
+                    .filter(g => g.Status === filterStatus)
+                    .sort((a, b) => b.Total_Votes - a.Total_Votes)
+                    .slice(0, count);
+                embed = new EmbedBuilder()
+                    .setTitle(`${statusEmoji[filterStatus] || '🎮'} Top ${count} Games — ${filterStatus}`)
+                    .setDescription(`Games currently at **${filterStatus}** status`)
+                    .setColor(filterStatus === 'Popular' ? 0xFF4500 : filterStatus === 'Rising' ? 0xFFAA00 : filterStatus === 'Approved' ? 0x00CC44 : filterStatus === 'Archived' ? 0x808080 : 0x0099FF);
+                if (games.length === 0)
+                    return interaction.followUp({ content: `❌ No games found with status **${filterStatus}**.`, flags: [MessageFlags.Ephemeral] });
+            }
+
+            games.forEach((g, i) => embed.addFields(formatGame(g, i)));
+            if (games.length === 0) embed.setDescription('No games found.');
+            embed.setFooter({ text: '🔒 Admin only — vote counts are not shown publicly' }).setTimestamp();
             return interaction.followUp({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
         }
 
