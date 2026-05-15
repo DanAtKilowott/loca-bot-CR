@@ -1442,6 +1442,122 @@ class LocalizationBot {
         }
     }
 
+    // ── Reset Helpers ───────────────────────────────────────────────────────────
+
+    async _writeAuditLog(adminId, action, detail = '') {
+        try {
+            let auditSheet = this.doc.sheetsByTitle['Audit_Log'];
+            if (!auditSheet) {
+                auditSheet = await this.doc.addSheet({
+                    title: 'Audit_Log',
+                    headerValues: ['Timestamp_UTC', 'Admin_User_ID', 'Action', 'Detail'],
+                });
+            }
+            await auditSheet.addRow({
+                Timestamp_UTC: new Date().toISOString(),
+                Admin_User_ID: adminId,
+                Action: action,
+                Detail: detail,
+            });
+        } catch (e) {
+            console.error('⚠️ Failed to write audit log:', e.message);
+        }
+    }
+
+    async _executeFullReset(interaction) {
+        await this._writeAuditLog(interaction.user.id, 'FULL_RESET',
+            `${this.gamesCache.length} games, ${this.votesCache.length} votes`);
+
+        // Delete Discord threads from new-submissions
+        if (NEW_CHANNEL_ID) {
+            for (const guild of this.client.guilds.cache.values()) {
+                try {
+                    const channel = guild.channels.cache.get(NEW_CHANNEL_ID) ||
+                        await guild.channels.fetch(NEW_CHANNEL_ID).catch(() => null);
+                    if (!channel) continue;
+
+                    for (const game of this.gamesCache) {
+                        if (!game.Thread_ID) continue;
+                        const thread = await guild.channels.fetch(game.Thread_ID).catch(() => null);
+                        if (thread) await thread.delete().catch(() => { });
+                    }
+                } catch (e) {
+                    console.warn('⚠️ Thread cleanup error:', e.message);
+                }
+            }
+        }
+
+        // Wipe Sheet rows (delete in reverse to avoid index shifting)
+        const voteRows = await this.votesSheet.getRows();
+        for (const row of voteRows.reverse()) await row.delete().catch(() => { });
+
+        const gameRows = await this.gamesSheet.getRows();
+        for (const row of gameRows.reverse()) await row.delete().catch(() => { });
+
+        // Clear caches
+        this.gamesCache = [];
+        this.votesCache = [];
+        this.submissionTracker.clear();
+        this.pendingSubmissions.clear();
+    }
+
+    async _executeGameDelete(gameId, interaction) {
+        const game = this.gamesCache.find(g => g.Game_ID === gameId);
+        if (!game) throw new Error(`Game ${gameId} not found`);
+
+        await this._writeAuditLog(interaction.user.id, 'DELETE_GAME', gameId);
+
+        // Delete Discord thread
+        if (NEW_CHANNEL_ID && game.Thread_ID) {
+            for (const guild of this.client.guilds.cache.values()) {
+                const thread = await guild.channels.fetch(game.Thread_ID).catch(() => null);
+                if (thread) await thread.delete().catch(() => { });
+            }
+        }
+
+        // Delete vote rows for this game
+        const voteRows = await this.votesSheet.getRows();
+        for (const row of voteRows.reverse()) {
+            if (row.get('Game_ID') === gameId) await row.delete().catch(() => { });
+        }
+
+        // Delete the game row
+        await game._row.delete();
+
+        // Update caches
+        this.gamesCache = this.gamesCache.filter(g => g.Game_ID !== gameId);
+        this.votesCache = this.votesCache.filter(v => String(v.Game_ID) !== String(gameId));
+    }
+
+    async _executeVotesReset(gameId, interaction) {
+        const game = this.gamesCache.find(g => g.Game_ID === gameId);
+        if (!game) throw new Error(`Game ${gameId} not found`);
+
+        await this._writeAuditLog(interaction.user.id, 'RESET_VOTES', gameId);
+
+        // Delete vote rows for this game
+        const voteRows = await this.votesSheet.getRows();
+        for (const row of voteRows.reverse()) {
+            if (row.get('Game_ID') === gameId) await row.delete().catch(() => { });
+        }
+
+        // Zero out vote counters on the game row
+        game._row.set('Total_Votes', '0');
+        game._row.set('Total_Owned_Yes', '0');
+        game._row.set('Total_Owned_No', '0');
+        game._row.set('Total_Willing_Pay_Count', '0');
+        game._row.set('Total_Willing_Pay_Sum', '0');
+        await game._row.save();
+
+        // Update caches
+        game.Total_Votes = 0;
+        game.Total_Owned_Yes = 0;
+        game.Total_Owned_No = 0;
+        game.Total_Willing_Pay_Count = 0;
+        game.Total_Willing_Pay_Sum = 0;
+        this.votesCache = this.votesCache.filter(v => String(v.Game_ID) !== String(gameId));
+    }
+
     // ── Command Registration ────────────────────────────────────────────────────
     async registerCommands() {
         const commands = [
@@ -1548,6 +1664,22 @@ class LocalizationBot {
                 name: 'approve', description: '[ADMIN] Approve a game for localization pursuit',
                 options: [{ type: 3, name: 'game_id', description: 'Game ID (e.g. GAME_00001)', required: true }],
                 default_member_permissions: '8'
+            },
+            {
+                name: 'reset', description: '[ADMIN] Reset bot data',
+                default_member_permissions: '8',
+                options: [
+                    { type: 1, name: 'full', description: 'Wipe all games, votes, Discord posts and caches' },
+                    {
+                        type: 1, name: 'game', description: 'Delete a specific game and all its votes',
+                        options: [{ type: 3, name: 'game_id', description: 'Game ID (e.g. GAME_00001)', required: true }]
+                    },
+                    {
+                        type: 1, name: 'votes', description: 'Zero out all vote data for a specific game',
+                        options: [{ type: 3, name: 'game_id', description: 'Game ID (e.g. GAME_00001)', required: true }]
+                    },
+                    { type: 1, name: 'cache', description: 'Re-sync in-memory cache from the Sheet (safe, no deletion)' }
+                ]
             },
         ];
 
@@ -1960,6 +2092,78 @@ class LocalizationBot {
             return interaction.followUp({ content: "✅ Rankings updated!", flags: [MessageFlags.Ephemeral] });
         }
 
+        if (commandName === 'reset') {
+            const sub = interaction.options.getSubcommand();
+
+            if (sub === 'cache') {
+                await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+                await this.refreshCache();
+                return interaction.followUp({ content: `✅ Cache refreshed — ${this.gamesCache.length} games, ${this.votesCache.length} votes loaded.`, flags: [MessageFlags.Ephemeral] });
+            }
+
+            if (sub === 'full') {
+                const gameCount = this.gamesCache.length;
+                const voteCount = this.votesCache.length;
+
+                const embed = new EmbedBuilder()
+                    .setTitle('🚨 Full Data Reset')
+                    .setColor(0xFF0000)
+                    .setDescription([
+                        '**This will permanently destroy:**',
+                        `• **${gameCount}** game records in the Sheet`,
+                        `• **${voteCount}** vote records in the Sheet`,
+                        '• All Discord threads in `new-submissions`',
+                        '• All in-memory caches',
+                        '',
+                        'This action **cannot be undone**.',
+                        'An audit log entry will be written before the wipe.',
+                    ].join('\n'));
+
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId('reset_proceed_full').setLabel('Proceed →').setStyle(ButtonStyle.Danger),
+                    new ButtonBuilder().setCustomId('reset_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+                );
+
+                return interaction.reply({ embeds: [embed], components: [row], flags: [MessageFlags.Ephemeral] });
+            }
+
+            if (sub === 'game') {
+                const gameId = interaction.options.getString('game_id');
+                const game = this.gamesCache.find(g => g.Game_ID === gameId);
+                if (!game) return interaction.reply({ content: `❌ Game \`${gameId}\` not found.`, flags: [MessageFlags.Ephemeral] });
+
+                const voteCount = this.votesCache.filter(v => String(v.Game_ID) === String(gameId)).length;
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`reset_confirm_game_${gameId}`).setLabel('Delete Game').setStyle(ButtonStyle.Danger),
+                    new ButtonBuilder().setCustomId('reset_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+                );
+
+                return interaction.reply({
+                    content: `⚠️ Delete **${game.Canonical_Title}** (\`${gameId}\`) and its **${voteCount}** vote(s)? This cannot be undone.`,
+                    components: [row],
+                    flags: [MessageFlags.Ephemeral],
+                });
+            }
+
+            if (sub === 'votes') {
+                const gameId = interaction.options.getString('game_id');
+                const game = this.gamesCache.find(g => g.Game_ID === gameId);
+                if (!game) return interaction.reply({ content: `❌ Game \`${gameId}\` not found.`, flags: [MessageFlags.Ephemeral] });
+
+                const voteCount = this.votesCache.filter(v => String(v.Game_ID) === String(gameId)).length;
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`reset_confirm_votes_${gameId}`).setLabel('Clear Votes').setStyle(ButtonStyle.Danger),
+                    new ButtonBuilder().setCustomId('reset_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+                );
+
+                return interaction.reply({
+                    content: `⚠️ Clear all **${voteCount}** vote(s) for **${game.Canonical_Title}** (\`${gameId}\`)? The game record will remain.`,
+                    components: [row],
+                    flags: [MessageFlags.Ephemeral],
+                });
+            }
+        }
+
         if (commandName === 'approve') {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
             if (!interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)) {
@@ -2076,6 +2280,48 @@ class LocalizationBot {
                 return interaction.reply({ content: `❌ ${check.reason}`, flags: [MessageFlags.Ephemeral] });
 
             return interaction.showModal(buildVoteModal(gameId));
+        }
+
+        // ── Reset buttons ────────────────────────────────────────────────────────
+        if (interaction.customId === 'reset_cancel') {
+            return interaction.update({ content: '❌ Reset cancelled.', embeds: [], components: [] });
+        }
+
+        if (interaction.customId === 'reset_proceed_full') {
+            const modal = new ModalBuilder()
+                .setCustomId('reset_full_confirm')
+                .setTitle('Confirm Full Reset');
+            const input = new TextInputBuilder()
+                .setCustomId('reset_confirm_text')
+                .setLabel('Type CONFIRM to proceed')
+                .setStyle(TextInputStyle.Short)
+                .setRequired(true);
+            modal.addComponents(new ActionRowBuilder().addComponents(input));
+            return interaction.showModal(modal);
+        }
+
+        if (interaction.customId.startsWith('reset_confirm_game_')) {
+            const gameId = interaction.customId.replace('reset_confirm_game_', '');
+            await interaction.update({ content: `⏳ Deleting \`${gameId}\`…`, components: [] });
+            try {
+                await this._executeGameDelete(gameId, interaction);
+                return interaction.editReply({ content: `✅ Game \`${gameId}\` and its votes have been deleted.` });
+            } catch (err) {
+                console.error(err);
+                return interaction.editReply({ content: `❌ Error deleting game: ${err.message}` });
+            }
+        }
+
+        if (interaction.customId.startsWith('reset_confirm_votes_')) {
+            const gameId = interaction.customId.replace('reset_confirm_votes_', '');
+            await interaction.update({ content: `⏳ Clearing votes for \`${gameId}\`…`, components: [] });
+            try {
+                await this._executeVotesReset(gameId, interaction);
+                return interaction.editReply({ content: `✅ All votes for \`${gameId}\` have been cleared.` });
+            } catch (err) {
+                console.error(err);
+                return interaction.editReply({ content: `❌ Error clearing votes: ${err.message}` });
+            }
         }
 
         // Unknown button — acknowledge silently so Discord doesn't show "interaction failed"
@@ -2200,6 +2446,30 @@ class LocalizationBot {
             } catch (e) {
                 console.error('❌ Error processing vote:', e);
                 return interaction.followUp({ content: "❌ An error occurred." });
+            }
+        }
+
+        // ── Full reset confirmation modal ─────────────────────────────────────────
+        if (interaction.customId === 'reset_full_confirm') {
+            const text = interaction.fields.getTextInputValue('reset_confirm_text').trim();
+            if (text !== 'CONFIRM') {
+                return interaction.followUp({ content: '❌ Text did not match. Reset cancelled.', flags: [MessageFlags.Ephemeral] });
+            }
+
+            // Post public warning before starting
+            const adminTag = `<@${interaction.user.id}>`;
+            const warningMsg = await interaction.channel.send(
+                `🚨 ${adminTag} is performing a **full data reset**. All games and votes will be wiped. Stand by…`
+            ).catch(() => null);
+
+            try {
+                await this._executeFullReset(interaction);
+                if (warningMsg) await warningMsg.edit('✅ **Full reset complete.** All game and vote data has been cleared.').catch(() => { });
+                return interaction.followUp({ content: '✅ Full reset complete.', flags: [MessageFlags.Ephemeral] });
+            } catch (err) {
+                console.error(err);
+                if (warningMsg) await warningMsg.edit(`❌ Reset failed: ${err.message}`).catch(() => { });
+                return interaction.followUp({ content: `❌ Reset failed: ${err.message}`, flags: [MessageFlags.Ephemeral] });
             }
         }
 
